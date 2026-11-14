@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Card RPG Battle</title>
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Telegram WebApp SDK -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  
+  <!-- Phaser 3 -->
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.70.0/dist/phaser.min.js"></script>
+  
+  <!-- React 18 -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  
+  <!-- Zustand (UMD) -->
+  <script src="https://cdn.jsdelivr.net/npm/zustand@4.5.0/umd/index.umd.js"></script>
+  
+  <!-- Babel для JSX -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #0a0a0f; }
+    #root { width: 100vw; height: 100vh; position: relative; }
+    #game-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+    #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10; pointer-events: none; }
+    #ui-layer > * { pointer-events: auto; }
+    .card-hover { transition: transform 0.2s, filter 0.2s; }
+    .card-hover:hover { transform: translateY(-20px); filter: brightness(1.2); }
+    .card-disabled { opacity: 0.4; pointer-events: none !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+    const { useEffect, useRef, useState, useMemo } = React;
+    const { create } = window.zustand;
+
+    // ============================================================
+    // 1. TELEGRAM PROVIDER
+    // ============================================================
+    const useTelegram = () => {
+      const [theme, setTheme] = useState('light');
+      const [platform, setPlatform] = useState('unknown');
+
+      useEffect(() => {
+        if (!window.Telegram?.WebApp) return;
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+        setTheme(tg.colorScheme || 'light');
+        setPlatform(tg.platform || 'unknown');
+
+        // Применяем тему
+        document.documentElement.classList.toggle('dark', tg.colorScheme === 'dark');
+        
+        tg.onEvent('themeChanged', () => {
+          setTheme(tg.colorScheme);
+          document.documentElement.classList.toggle('dark', tg.colorScheme === 'dark');
+        });
+
+        // Haptic feedback helper
+        window.haptic = (type = 'light') => {
+          try { tg.HapticFeedback.impactOccurred(type); } catch(e) {}
+        };
+      }, []);
+
+      return { theme, platform, tg: window.Telegram?.WebApp };
+    };
+
+    // ============================================================
+    // 2. ZUSTAND STORE — Battle State
+    // ============================================================
+    const useBattleStore = create((set, get) => ({
+      // Персонажи
+      player: { name: 'Герой', hp: 50, maxHp: 50, energy: 3, maxEnergy: 3, block: 0 },
+      enemy:  { name: 'Дракон', hp: 40, maxHp: 40, energy: 0, maxEnergy: 0, block: 0 },
+      
+      // Карты
+      deck: [],
+      hand: [],
+      discard: [],
+      
+      // Состояние
+      turn: 1,
+      phase: 'player', // 'player' | 'enemy' | 'animating' | 'victory' | 'defeat'
+      log: [],
+
+      // Инициализация боя
+      initBattle: () => {
+        const deck = [
+          { id: 'c1', name: 'Удар', cost: 1, type: 'attack', value: 8, desc: 'Наносит 8 урона', color: '#ef4444' },
+          { id: 'c2', name: 'Мощный удар', cost: 2, type: 'attack', value: 15, desc: 'Наносит 15 урона', color: '#dc2626' },
+          { id: 'c3', name: 'Блок', cost: 1, type: 'defense', value: 6, desc: 'Блокирует 6 урона', color: '#3b82f6' },
+          { id: 'c4', name: 'Щит', cost: 2, type: 'defense', value: 12, desc: 'Блокирует 12 урона', color: '#2563eb' },
+          { id: 'c5', name: 'Ярость', cost: 0, type: 'buff', value: 1, desc: '+1 энергии', color: '#f59e0b' },
+          { id: 'c6', name: 'Огненный шар', cost: 3, type: 'attack', value: 22, desc: 'Наносит 22 урона', color: '#f97316' },
+        ];
+        // Дублируем для полноты колоды
+        const fullDeck = [...deck, ...deck, ...deck].map((c, i) => ({ ...c, uid: `${c.id}_${i}` }));
+        set({
+          deck: fullDeck.sort(() => Math.random() - 0.5),
+          hand: [],
+          discard: [],
+          player: { name: 'Герой', hp: 50, maxHp: 50, energy: 3, maxEnergy: 3, block: 0 },
+          enemy:  { name: 'Дракон', hp: 40, maxHp: 40, energy: 0, maxEnergy: 0, block: 0 },
+          turn: 1,
+          phase: 'player',
+          log: ['⚔️ Бой начинается!'],
+        });
+        get().drawCards(4);
+      },
+
+      // Добор карт
+      drawCards: (n) => {
+        const { deck, hand, discard } = get();
+        let newDeck = [...deck];
+        let newDiscard = [...discard];
+        const drawn = [];
+        for (let i = 0; i < n; i++) {
+          if (newDeck.length === 0) {
+            if (newDiscard.length === 0) break;
+            newDeck = newDiscard.sort(() => Math.random() - 0.5);
+            newDiscard = [];
+          }
+          drawn.push(newDeck.pop());
+        }
+        set({ deck: newDeck, discard: newDiscard, hand: [...hand, ...drawn] });
+      },
+
+      // Сыграть карту
+      playCard: (uid) => {
+        const { hand, player, enemy, phase } = get();
+        if (phase !== 'player') return;
+        const card = hand.find(c => c.uid === uid);
+        if (!card || card.cost > player.energy) return;
+
+        set({ phase: 'animating' });
+        window.haptic?.('medium');
+
+        // Отправляем событие в Phaser
+        window.dispatchEvent(new CustomEvent('game:playCard', { detail: { card, target: 'enemy' } }));
+
+        setTimeout(() => {
+          let newPlayer = { ...player, energy: player.energy - card.cost };
+          let newEnemy = { ...enemy };
+          let newLog = [...get().log];
+
+          if (card.type === 'attack') {
+            const dmg = Math.max(0, card.value - newEnemy.block);
+            newEnemy.hp = Math.max(0, newEnemy.hp - dmg);
+            newEnemy.block = Math.max(0, newEnemy.block - card.value);
+            newLog.push(`⚔️ ${card.name}: -${dmg} HP врагу`);
+          } else if (card.type === 'defense') {
+            newPlayer.block += card.value;
+            newLog.push(`🛡️ ${card.name}: +${card.value} блока`);
+          } else if (card.type === 'buff') {
+            newPlayer.energy = Math.min(newPlayer.maxEnergy, newPlayer.energy + card.value);
+            newLog.push(`✨ ${card.name}: +${card.value} энергии`);
+          }
+
+          set({
+            player: newPlayer,
+            enemy: newEnemy,
+            hand: hand.filter(c => c.uid !== uid),
+            discard: [...get().discard, card],
+            log: newLog.slice(-5),
+            phase: newEnemy.hp <= 0 ? 'victory' : (newPlayer.hp <= 0 ? 'defeat' : 'player'),
+          });
+        }, 600);
+      },
+
+      // Конец хода
+      endTurn: () => {
+        const { hand, discard, player } = get();
+        window.haptic?.('light');
+        set({
+          hand: [],
+          discard: [...discard, ...hand],
+          phase: 'enemy',
+          log: [...get().log, '⏳ Ход противника...'],
+        });
+
+        // Ход врага через 1с
+        setTimeout(() => {
+          const enemyDmg = 6 + Math.floor(Math.random() * 8);
+          const actualDmg = Math.max(0, enemyDmg - player.block);
+          const newPlayer = {
+            ...player,
+            hp: Math.max(0, player.hp - actualDmg),
+            block: 0,
+          };
+          set({
+            player: newPlayer,
+            log: [...get().log, `🔥 Враг наносит ${actualDmg} урона`],
+            phase: newPlayer.hp <= 0 ? 'defeat' : 'player',
+          });
+
+          // Новый ход игрока
+          setTimeout(() => {
+            const { maxEnergy } = newPlayer;
+            set({
+              player: { ...newPlayer, energy: maxEnergy, block: 0 },
+              turn: get().turn + 1,
+              log: [...get().log, `🔄 Ход ${get().turn + 1}`],
+            });
+            get().drawCards(4);
+          }, 500);
+        }, 1000);
+      },
+
+      // Рестарт
+      restart: () => get().initBattle(),
+    }));
+
+    // ============================================================
+    // 3. PHASER GAME — Атлас + Анимации + Сцена боя
+    // ============================================================
+    const usePhaserGame = (containerRef) => {
+      const gameRef = useRef(null);
+
+      useEffect(() => {
+        if (!containerRef.current) return;
+
+        // --- ПАРСЕР АТЛАСА ---
+        const parseSpriteName = (name) => {
+          const m = name.match(/s(\d+)_img(\d+)_pal(\d+)_tr(\d+)/);
+          if (!m) return null;
+          return { spriteId: +m[1], imgId: +m[2], palId: +m[3], trId: +m[4] };
+        };
+
+        const groupAnimations = (sprites) => {
+          const groups = new Map();
+          Object.entries(sprites).forEach(([name, coords]) => {
+            const p = parseSpriteName(name);
+            if (!p) return;
+            const key = `img${p.imgId}_pal${p.palId}`;
+            if (!groups.has(key)) groups.set(key, { imgId: p.imgId, palId: p.palId, frames: [] });
+            groups.get(key).frames.push({ name, ...coords, trId: p.trId });
+          });
+          groups.forEach(g => g.frames.sort((a, b) => a.trId - b.trId));
+          return groups;
+        };
+
+        // --- ЗАГРУЗКА АТЛАСА ---
+        // ВАЖНО: atlas.png должен лежать рядом с index.html
+        // Для демо создаём процедурный спрайт, если PNG не загружен
+        const atlasJson = {
+          "image": "atlas.png",
+          "sprites": {
+            "hero_idle_tr0": { "x": 0, "y": 0, "w": 64, "h": 64 },
+            "hero_idle_tr1": { "x": 64, "y": 0, "w": 64, "h": 64 },
+            "hero_idle_tr2": { "x": 128, "y": 0, "w": 64, "h": 64 },
+            "hero_idle_tr3": { "x": 192, "y": 0, "w": 64, "h": 64 },
+            "hero_attack_tr0": { "x": 0, "y": 64, "w": 64, "h": 64 },
+            "hero_attack_tr1": { "x": 64, "y": 64, "w": 64, "h": 64 },
+            "hero_attack_tr2": { "x": 128, "y": 64, "w": 64, "h": 64 },
+            "hero_attack_tr3": { "x": 192, "y": 64, "w": 64, "h": 64 },
+            "hero_hit_tr0": { "x": 0, "y": 128, "w": 64, "h": 64 },
+            "hero_hit_tr1": { "x": 64, "y": 128, "w": 64, "h": 64 },
+            "enemy_idle_tr0": { "x": 256, "y": 0, "w": 64, "h": 64 },
+            "enemy_idle_tr1": { "x": 320, "y": 0, "w": 64, "h": 64 },
+            "enemy_idle_tr2": { "x": 384, "y": 0, "w": 64, "h": 64 },
+            "enemy_idle_tr3": { "x": 448, "y": 0, "w": 64, "h": 64 },
+            "enemy_attack_tr0": { "x": 256, "y": 64, "w": 64, "h": 64 },
+            "enemy_attack_tr1": { "x": 320, "y": 64, "w": 64, "h": 64 },
+            "enemy_attack_tr2": { "x": 384, "y": 64, "w": 64, "h": 64 },
+            "enemy_hit_tr0": { "x": 256, "y": 128, "w": 64, "h": 64 },
+            "enemy_hit_tr1": { "x": 320, "y": 128, "w": 64, "h": 64 },
+          }
+        };
+
+        // --- СЦЕНА ЗАГРУЗКИ ---
+        class BootScene extends Phaser.Scene {
+          constructor() { super({ key: 'BootScene' }); }
+          preload() {
+            // Пробуем загрузить реальный атлас
+            this.load.atlas('game_atlas', 'atlas.png', null);
+            this.load.on('loaderror', () => {
+              // Если не загрузился — создаём процедурный
+              this.createProceduralAtlas();
+            });
+          }
+          create() {
+            // Создаём анимации из JSON (даже если PNG не загрузился, используем процедурный)
+            this.createAnimations();
+            this.scene.start('BattleScene');
+          }
+          createProceduralAtlas() {
+            const g = this.make.graphics({ add: false });
+            const size = 64;
+            const cols = 8;
+            const rows = 4;
+            g.fillStyle(0x1a1a2e);
+            g.fillRect(0, 0, cols * size, rows * size);
+            
+            // Рисуем процедурные спрайты
+            const drawFrame = (x, y, color, label) => {
+              g.fillStyle(color);
+              g.fillCircle(x + size/2, y + size/2, size/3);
+              g.fillStyle(0xffffff);
+              g.fillCircle(x + size/2 - 8, y + size/2 - 8, 4);
+              g.fillCircle(x + size/2 + 8, y + size/2 - 8, 4);
+            };
+            
+            // Hero idle
+            for (let i = 0; i < 4; i++) drawFrame(i * size, 0, 0x3b82f6, 'hi');
+            // Hero attack
+            for (let i = 0; i < 4; i++) drawFrame(i * size, size, 0xef4444, 'ha');
+            // Hero hit
+            for (let i = 0; i < 2; i++) drawFrame(i * size, size * 2, 0xfbbf24, 'hh');
+            // Enemy idle
+            for (let i = 0; i < 4; i++) drawFrame(256 + i * size, 0, 0x8b5cf6, 'ei');
+            // Enemy attack
+            for (let i = 0; i < 3; i++) drawFrame(256 + i * size, size, 0xf97316, 'ea');
+            // Enemy hit
+            for (let i = 0; i < 2; i++) drawFrame(256 + i * size, size * 2, 0xeab308, 'eh');
+            
+            g.generateTexture('game_atlas', cols * size, rows * size);
+            g.destroy();
+          }
+          createAnimations() {
+            const create = (key, prefix, frames, fps = 8, repeat = -1) => {
+              this.anims.create({
+                key,
+                frames: frames.map(f => ({ key: 'game_atlas', frame: `${prefix}_tr${f}` })),
+                frameRate: fps,
+                repeat,
+              });
+            };
+            create('hero_idle', 'hero_idle', [0,1,2,3], 6, -1);
+            create('hero_attack', 'hero_attack', [0,1,2,3], 12, 0);
+            create('hero_hit', 'hero_hit', [0,1], 10, 0);
+            create('enemy_idle', 'enemy_idle', [0,1,2,3], 6, -1);
+            create('enemy_attack', 'enemy_attack', [0,1,2], 12, 0);
+            create('enemy_hit', 'enemy_hit', [0,1], 10, 0);
+          }
+        }
+
+        // --- СЦЕНА БОЯ ---
+        class BattleScene extends Phaser.Scene {
+          constructor() { super({ key: 'BattleScene' }); }
+          create() {
+            const W = this.scale.width;
+            const H = this.scale.height;
+
+            // Фон
+            const bg = this.add.graphics();
+            const grad = bg.fillGradientStyle(0x1a1a2e, 0x1a1a2e, 0x0f0f1a, 0x0f0f1a, 1);
+            bg.fillRect(0, 0, W, H);
+
+            // Земля
+            bg.fillStyle(0x2d1b4e, 0.5);
+            bg.fillEllipse(W/2, H * 0.75, W * 0.9, 120);
+
+            // Герой
+            this.hero = this.add.sprite(W * 0.25, H * 0.55, 'game_atlas');
+            this.hero.setScale(2.5);
+            this.hero.play('hero_idle');
+
+            // Враг
+            this.enemy = this.add.sprite(W * 0.75, H * 0.5, 'game_atlas');
+            this.enemy.setScale(3);
+            this.enemy.setFlipX(true);
+            this.enemy.play('enemy_idle');
+
+            // Подписка на события карт
+            window.addEventListener('game:playCard', (e) => {
+              const { card, target } = e.detail;
+              this.playCardAnimation(card, target);
+            });
+
+            // Подписка на store для HP
+            this.storeUnsub = useBattleStore.subscribe((state) => {
+              this.updateHealthBars(state);
+            });
+          }
+
+          playCardAnimation(card, target) {
+            if (card.type === 'attack') {
+              // Анимация атаки героя
+              this.hero.play('hero_attack');
+              this.tweens.add({
+                targets: this.hero,
+                x: this.hero.x + 80,
+                duration: 200,
+                yoyo: true,
+                ease: 'Power2',
+              });
+              // Через 300мс — враг получает урон
+              setTimeout(() => {
+                this.enemy.play('enemy_hit');
+                this.showDamage(this.enemy.x, this.enemy.y - 80, card.value, '#ef4444');
+                window.haptic?.('heavy');
+                setTimeout(() => this.enemy.play('enemy_idle'), 400);
+              }, 300);
+              setTimeout(() => this.hero.play('hero_idle'), 500);
+            } else if (card.type === 'defense') {
+              this.showDamage(this.hero.x, this.hero.y - 80, `+${card.value}`, '#3b82f6');
+              this.tweens.add({
+                targets: this.hero,
+                alpha: 0.5,
+                duration: 200,
+                yoyo: true,
+                repeat: 2,
+              });
+            } else {
+              this.showDamage(this.hero.x, this.hero.y - 80, `+${card.value}⚡`, '#f59e0b');
+            }
+          }
+
+          showDamage(x, y, text, color) {
+            const txt = this.add.text(x, y, String(text), {
+              fontSize: '32px',
+              color,
+              fontStyle: 'bold',
+              stroke: '#000',
+              strokeThickness: 4,
+            }).setOrigin(0.5);
+            this.tweens.add({
+              targets: txt,
+              y: y - 60,
+              alpha: 0,
+              duration: 800,
+              onComplete: () => txt.destroy(),
+            });
+          }
+
+          updateHealthBars(state) {
+            // Обновление будет через React UI, но здесь можно добавить эффекты
+            if (state.phase === 'victory') {
+              this.cameras.main.shake(500, 0.01);
+              this.showDamage(this.scale.width/2, this.scale.height/2, 'ПОБЕДА!', '#fbbf24');
+            }
+          }
+
+          destroy() {
+            if (this.storeUnsub) this.storeUnsub();
+            super.destroy();
+          }
+        }
+
+        // --- КОНФИГ ИГРЫ ---
+        const config = {
+          type: Phaser.AUTO,
+          parent: containerRef.current,
+          width: window.innerWidth,
+          height: window.innerHeight,
+          backgroundColor: '#0a0a0f',
+          scale: {
+            mode: Phaser.Scale.RESIZE,
+            autoCenter: Phaser.Scale.CENTER_BOTH,
+          },
+          scene: [BootScene, BattleScene],
+          physics: { default: 'arcade' },
+        };
+
+        gameRef.current = new Phaser.Game(config);
+
+        return () => {
+          if (gameRef.current) {
+            gameRef.current.destroy(true);
+            gameRef.current = null;
+          }
+        };
+      }, [containerRef]);
+
+      return gameRef;
+    };
+
+    // ============================================================
+    // 4. REACT UI КОМПОНЕНТЫ
+    // ============================================================
+    const HealthBar = ({ current, max, color = 'bg-green-500', label }) => {
+      const pct = Math.max(0, (current / max) * 100);
+      return (
+        <div className="w-full">
+          <div className="flex justify-between text-xs mb-1 text-white font-bold">
+            <span>{label}</span>
+            <span>{current}/{max}</span>
+          </div>
+          <div className="w-full h-3 bg-gray-800 rounded-full overflow-hidden border border-gray-700">
+            <div 
+              className={`h-full ${color} transition-all duration-500`}
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+        </div>
+      );
+    };
+
+    const EnergyBar = ({ current, max }) => (
+      <div className="flex gap-1">
+        {Array.from({ length: max }).map((_, i) => (
+          <div
+            key={i}
+            className={`w-6 h-6 rounded-full border-2 border-yellow-400 flex items-center justify-center text-xs font-bold
+              ${i < current ? 'bg-yellow-400 text-black' : 'bg-gray-800 text-gray-600'}`}
+          >
+            ⚡
+          </div>
+        ))}
+      </div>
+    );
+
+    const Card = ({ card, canPlay, onClick }) => (
+      <div
+        onClick={() => canPlay && onClick(card.uid)}
+        className={`card-hover relative w-24 h-36 rounded-lg border-2 p-2 flex flex-col cursor-pointer select-none
+          ${canPlay ? 'border-yellow-400 shadow-lg shadow-yellow-500/30' : 'border-gray-600 card-disabled'}
+          ${card.type === 'attack' ? 'bg-gradient-to-b from-red-900 to-red-950' : ''}
+          ${card.type === 'defense' ? 'bg-gradient-to-b from-blue-900 to-blue-950' : ''}
+          ${card.type === 'buff' ? 'bg-gradient-to-b from-amber-900 to-amber-950' : ''}
+        `}
+      >
+        <div className="absolute -top-2 -left-2 w-7 h-7 bg-yellow-400 rounded-full flex items-center justify-center text-black font-bold text-sm border-2 border-yellow-600">
+          {card.cost}
+        </div>
+        <div className="flex-1 flex items-center justify-center text-3xl">
+          {card.type === 'attack' ? '⚔️' : card.type === 'defense' ? '🛡️' : '✨'}
+        </div>
+        <div className="text-center text-white text-xs font-bold mb-1">{card.name}</div>
+        <div className="text-center text-gray-300 text-[10px] leading-tight">{card.desc}</div>
+      </div>
+    );
+
+    const BattleLog = ({ log }) => (
+      <div className="absolute top-20 left-2 w-48 bg-black/60 backdrop-blur rounded-lg p-2 text-xs text-white space-y-1 max-h-32 overflow-hidden">
+        {log.slice(-4).map((entry, i) => (
+          <div key={i} className="opacity-80">{entry}</div>
+        ))}
+      </div>
+    );
+
+    // ============================================================
+    // 5. ГЛАВНЫЙ APP
+    // ============================================================
+    const App = () => {
+      const gameContainerRef = useRef(null);
+      const { theme, tg } = useTelegram();
+      usePhaserGame(gameContainerRef);
+
+      const {
+        player, enemy, hand, turn, phase, log,
+        initBattle, playCard, endTurn, restart,
+      } = useBattleStore();
+
+      useEffect(() => {
+        initBattle();
+        if (tg?.MainButton) {
+          tg.MainButton.setText('ЗАВЕРШИТЬ ХОД');
+          tg.MainButton.show();
+          tg.MainButton.onClick(endTurn);
+        }
+        return () => tg?.MainButton?.hide();
+      }, []);
+
+      // Обновляем MainButton в зависимости от фазы
+      useEffect(() => {
+        if (!tg?.MainButton) return;
+        if (phase === 'player') {
+          tg.MainButton.enable();
+          tg.MainButton.show();
+        } else if (phase === 'enemy' || phase === 'animating') {
+          tg.MainButton.disable();
+        } else if (phase === 'victory' || phase === 'defeat') {
+          tg.MainButton.setText('НОВЫЙ БОЙ').enable();
+          tg.MainButton.onClick(restart);
+        }
+      }, [phase, tg]);
+
+      const isDark = theme === 'dark';
+
+      return (
+        <div className={`w-full h-full relative ${isDark ? 'dark' : ''}`}>
+          {/* Phaser Canvas */}
+          <div ref={gameContainerRef} id="game-container" />
+
+          {/* UI Overlay */}
+          <div id="ui-layer" className="flex flex-col justify-between p-3">
+            
+            {/* Верх: HUD */}
+            <div className="flex justify-between items-start gap-4">
+              {/* Игрок */}
+              <div className="bg-black/60 backdrop-blur rounded-lg p-3 w-48">
+                <div className="text-white font-bold text-sm mb-2">🧙 {player.name}</div>
+                <HealthBar current={player.hp} max={player.maxHp} color="bg-green-500" label="HP" />
+                <div className="mt-2">
+                  <EnergyBar current={player.energy} max={player.maxEnergy} />
+                </div>
+                {player.block > 0 && (
+                  <div className="mt-2 text-xs text-blue-400">🛡️ Блок: {player.block}</div>
+                )}
+              </div>
+
+              {/* Центр: Ход */}
+              <div className="bg-black/60 backdrop-blur rounded-lg px-4 py-2 text-center">
+                <div className="text-yellow-400 font-bold text-lg">Ход {turn}</div>
+                <div className="text-xs text-gray-400">
+                  {phase === 'player' && '🎯 Ваш ход'}
+                  {phase === 'enemy' && '⏳ Ход врага'}
+                  {phase === 'animating' && '✨ Анимация'}
+                  {phase === 'victory' && '🏆 ПОБЕДА!'}
+                  {phase === 'defeat' && '💀 ПОРАЖЕНИЕ'}
+                </div>
+              </div>
+
+              {/* Враг */}
+              <div className="bg-black/60 backdrop-blur rounded-lg p-3 w-48">
+                <div className="text-white font-bold text-sm mb-2">🐉 {enemy.name}</div>
+                <HealthBar current={enemy.hp} max={enemy.maxHp} color="bg-red-500" label="HP" />
+                {enemy.block > 0 && (
+                  <div className="mt-2 text-xs text-blue-400">🛡️ Блок: {enemy.block}</div>
+                )}
+              </div>
+            </div>
+
+            {/* Лог боя */}
+            <BattleLog log={log} />
+
+            {/* Низ: Рука карт */}
+            <div className="flex justify-center items-end pb-4">
+              <div className="flex gap-2 overflow-x-auto max-w-full px-2 py-2">
+                {hand.length === 0 && phase === 'player' && (
+                  <div className="text-gray-500 text-sm">Нет карт в руке</div>
+                )}
+                {hand.map((card) => (
+                  <Card
+                    key={card.uid}
+                    card={card}
+                    canPlay={phase === 'player' && card.cost <= player.energy}
+                    onClick={playCard}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Экран победы/поражения */}
+          {(phase === 'victory' || phase === 'defeat') && (
+            <div className="absolute inset-0 bg-black/80 backdrop-blur flex items-center justify-center z-50 pointer-events-auto">
+              <div className="text-center">
+                <div className={`text-6xl font-bold mb-4 ${phase === 'victory' ? 'text-yellow-400' : 'text-red-500'}`}>
+                  {phase === 'victory' ? '🏆 ПОБЕДА!' : '💀 ПОРАЖЕНИЕ'}
+                </div>
+                <button
+                  onClick={restart}
+                  className="px-8 py-3 bg-yellow-500 hover:bg-yellow-400 text-black font-bold rounded-lg text-lg transition"
+                >
+                  Новый бой
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    };
+
+    // ============================================================
+    // 6. РЕНДЕР
+    // ============================================================
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
